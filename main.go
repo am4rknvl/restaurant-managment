@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"restaurant-system/internal/config"
 	"restaurant-system/internal/database"
 	"restaurant-system/internal/handlers"
 	"restaurant-system/internal/services"
@@ -16,6 +17,7 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using default values")
 	}
+	config.Load()
 
 	// Initialize database
 	db, err := database.Initialize()
@@ -44,6 +46,12 @@ func main() {
 
 	// Setup router
 	router := gin.Default()
+
+	// Share services in context
+	router.Use(func(c *gin.Context) {
+		c.Set("paymentService", paymentService)
+		c.Next()
+	})
 
 	// Enable CORS for frontend
 	router.Use(func(c *gin.Context) {
@@ -83,6 +91,7 @@ func main() {
 		{
 			payments.POST("", paymentHandler.ProcessPayment)
 			payments.GET("/:id", paymentHandler.GetPaymentStatus)
+			payments.POST("/notify/telebirr", handlers.TelebirrNotifyHandler)
 		}
 
 		// Account routes
@@ -105,18 +114,8 @@ func main() {
 		})
 	}
 
-	// Serve static files for frontend
+	// Serve static files (optional; Next.js runs separately)
 	router.Static("/static", "./web/static")
-	router.LoadHTMLGlob("web/templates/*")
-
-	// Serve frontend pages
-	router.GET("/", func(c *gin.Context) {
-		c.HTML(200, "customer.html", nil)
-	})
-
-	router.GET("/kitchen", func(c *gin.Context) {
-		c.HTML(200, "kitchen.html", nil)
-	})
 
 	log.Println("Starting restaurant system server on :8080")
 	if err := router.Run(":8080"); err != nil {

@@ -41,7 +41,7 @@ func (h *PaymentHandler) ProcessPayment(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Payment processed successfully",
+		"message": "Payment initiated",
 		"payment": response,
 	})
 }

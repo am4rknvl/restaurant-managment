@@ -2,9 +2,11 @@ package services
 
 import (
 	"fmt"
+	"os"
 	"restaurant-system/internal/database"
 	"restaurant-system/internal/models"
 	"restaurant-system/internal/payments"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,85 +28,126 @@ func (s *PaymentService) ProcessPayment(req *models.ProcessPaymentRequest) (*mod
 		"SELECT total_amount, status FROM orders WHERE id = $1",
 		req.OrderID,
 	).Scan(&orderAmount, &orderStatus)
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("order not found")
 	}
-	
-	if orderStatus == "completed" {
+
+	if orderStatus == string(models.OrderStatusCompleted) {
 		return nil, fmt.Errorf("order already completed")
 	}
-	
+
 	// Generate payment ID
 	paymentID := uuid.New().String()
-	transactionID := uuid.New().String()
-	
-	// Create payment record
+
+	// Create payment record (initial status processing)
 	payment := &models.Payment{
 		ID:            paymentID,
 		OrderID:       req.OrderID,
 		Amount:        orderAmount,
 		Method:        req.Method,
 		Status:        models.PaymentStatusProcessing,
-		TransactionID: transactionID,
+		TransactionID: "",
 		PhoneNumber:   req.PhoneNumber,
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
 	}
-	
-	// Store payment in database
-	_, err = s.db.Conn().Exec(
+	if _, err = s.db.Conn().Exec(
 		"INSERT INTO payments (id, order_id, amount, method, status, transaction_id, phone_number, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 		payment.ID, payment.OrderID, payment.Amount, payment.Method, payment.Status, payment.TransactionID, payment.PhoneNumber, payment.CreatedAt, payment.UpdatedAt,
-	)
-	if err != nil {
+	); err != nil {
 		return nil, err
 	}
-	
+
 	// Route by method
 	switch req.Method {
 	case models.PaymentMethodMobileMoney:
-		return s.processTelebirr(payment)
+		return s.initiateTelebirr(payment)
 	case models.PaymentMethodCash:
-		return s.processCashPayment(payment)
+		resp := s.processCashPayment(payment)
+		// Update payment status
+		_, err = s.db.Conn().Exec("UPDATE payments SET status = $1, updated_at = $2 WHERE id = $3", resp.Status, time.Now(), resp.ID)
+		if err != nil {
+			return nil, err
+		}
+		// Update order if completed
+		if resp.Status == models.PaymentStatusCompleted {
+			if err := s.updateOrderAfterPayment(payment.OrderID); err != nil {
+				return nil, err
+			}
+		}
+		return resp, nil
 	case models.PaymentMethodCard:
-		return s.processCardPayment(payment)
+		resp := s.processCardPayment(payment)
+		_, err = s.db.Conn().Exec("UPDATE payments SET status = $1, updated_at = $2 WHERE id = $3", resp.Status, time.Now(), resp.ID)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Status == models.PaymentStatusCompleted {
+			if err := s.updateOrderAfterPayment(payment.OrderID); err != nil {
+				return nil, err
+			}
+		}
+		return resp, nil
 	default:
 		return nil, fmt.Errorf("unsupported payment method")
 	}
 }
 
-func (s *PaymentService) processTelebirr(payment *models.Payment) (*models.PaymentResponse, error) {
-	// Initiate Telebirr payment and return checkout URL
-	initReq := &payments.InitiateRequest{
-		OutTradeNo:  payment.ID,
-		Subject:    "Restaurant Order",
-		TotalAmount: payment.Amount,
-		ReturnUrl:  "http://localhost:3000/app",
-		NotifyUrl:  "http://localhost:8080/api/v1/payments/telebirr/notify",
-		PhoneNumber: payment.PhoneNumber,
+func (s *PaymentService) initiateTelebirr(payment *models.Payment) (*models.PaymentResponse, error) {
+	notifyURL := os.Getenv("PUBLIC_NOTIFY_URL")
+	if notifyURL == "" {
+		// fallback to localhost for dev
+		notifyURL = "http://localhost:8080/api/v1/payments/notify/telebirr"
 	}
-	gwResp, err := payments.InitiatePayment(initReq)
+	returnURL := os.Getenv("PUBLIC_RETURN_URL")
+	if returnURL == "" {
+		returnURL = "http://localhost:3000/app"
+	}
+
+	gwResp, err := payments.InitiatePayment(&payments.InitiateRequest{
+		OutTradeNo:  payment.ID,
+		Subject:     "Restaurant Order " + payment.OrderID,
+		TotalAmount: payment.Amount,
+		ReturnUrl:   returnURL,
+		NotifyUrl:   notifyURL,
+		PhoneNumber: payment.PhoneNumber,
+	})
 	if err != nil {
-		// Mark as failed
+		// Mark payment failed
 		_, _ = s.db.Conn().Exec("UPDATE payments SET status = $1, updated_at = $2 WHERE id = $3", models.PaymentStatusFailed, time.Now(), payment.ID)
 		return nil, err
 	}
-	// Stay in processing until callback confirms
-	resp := &models.PaymentResponse{
+
+	// Store gateway trade number
+	_, _ = s.db.Conn().Exec("UPDATE payments SET transaction_id = $1, status = $2, updated_at = $3 WHERE id = $4", gwResp.TradeNo, models.PaymentStatusPending, time.Now(), payment.ID)
+
+	return &models.PaymentResponse{
+		ID:            payment.ID,
+		OrderID:       payment.OrderID,
+		Amount:        payment.Amount,
+		Method:        payment.Method,
+		Status:        models.PaymentStatusPending,
+		TransactionID: gwResp.TradeNo,
+		Message:       "Proceed to Telebirr to complete payment",
+		CheckoutURL:   gwResp.CheckoutURL,
+	}, nil
+}
+
+func (s *PaymentService) processMobileMoneyPayment(payment *models.Payment) *models.PaymentResponse {
+	// Deprecated in favor of initiateTelebirr
+	return &models.PaymentResponse{
 		ID:            payment.ID,
 		OrderID:       payment.OrderID,
 		Amount:        payment.Amount,
 		Method:        payment.Method,
 		Status:        models.PaymentStatusProcessing,
-		TransactionID: gwResp.TradeNo,
-		Message:       "Redirect to complete payment",
-		CheckoutURL:   gwResp.CheckoutURL,
+		TransactionID: payment.TransactionID,
+		Message:       "Initiated",
 	}
-	return resp, nil
 }
 
-func (s *PaymentService) processCashPayment(payment *models.Payment) (*models.PaymentResponse, error) {
+func (s *PaymentService) processCashPayment(payment *models.Payment) *models.PaymentResponse {
 	// Cash payments are typically handled manually
 	response := &models.PaymentResponse{
 		ID:            payment.ID,
@@ -115,13 +158,12 @@ func (s *PaymentService) processCashPayment(payment *models.Payment) (*models.Pa
 		TransactionID: payment.TransactionID,
 		Message:       "Cash payment received - order confirmed",
 	}
-	// Update order on success
-	_ = s.updateOrderAfterPayment(payment.OrderID)
-	_, _ = s.db.Conn().Exec("UPDATE payments SET status = $1, updated_at = $2 WHERE id = $3", models.PaymentStatusCompleted, time.Now(), payment.ID)
-	return response, nil
+
+	return response
 }
 
-func (s *PaymentService) processCardPayment(payment *models.Payment) (*models.PaymentResponse, error) {
+func (s *PaymentService) processCardPayment(payment *models.Payment) *models.PaymentResponse {
+	// Simulate card payment processing
 	response := &models.PaymentResponse{
 		ID:            payment.ID,
 		OrderID:       payment.OrderID,
@@ -131,9 +173,8 @@ func (s *PaymentService) processCardPayment(payment *models.Payment) (*models.Pa
 		TransactionID: payment.TransactionID,
 		Message:       "Payment processed successfully via card",
 	}
-	_ = s.updateOrderAfterPayment(payment.OrderID)
-	_, _ = s.db.Conn().Exec("UPDATE payments SET status = $1, updated_at = $2 WHERE id = $3", models.PaymentStatusCompleted, time.Now(), payment.ID)
-	return response, nil
+
+	return response
 }
 
 func (s *PaymentService) updateOrderAfterPayment(orderID string) error {
@@ -150,8 +191,83 @@ func (s *PaymentService) GetPaymentStatus(paymentID string) (*models.Payment, er
 		"SELECT id, order_id, amount, method, status, transaction_id, phone_number, created_at, updated_at FROM payments WHERE id = $1",
 		paymentID,
 	).Scan(&payment.ID, &payment.OrderID, &payment.Amount, &payment.Method, &payment.Status, &payment.TransactionID, &payment.PhoneNumber, &payment.CreatedAt, &payment.UpdatedAt)
+
 	if err != nil {
 		return nil, err
 	}
+
 	return &payment, nil
+}
+
+// HandleTelebirrCallback updates payment and order based on Telebirr callback payload.
+// Expected fields include at least one of: outTradeNo (our payment ID), tradeNo (gateway id),
+// and a status/result code (e.g., SUCCESS).
+func (s *PaymentService) HandleTelebirrCallback(data map[string]string) error {
+	// Extract identifiers
+	outTradeNo := data["outTradeNo"]
+	if outTradeNo == "" {
+		outTradeNo = data["out_trade_no"]
+	}
+	tradeNo := data["tradeNo"]
+	if tradeNo == "" {
+		tradeNo = data["trade_no"]
+	}
+
+	// Determine success
+	status := data["status"]
+	if status == "" {
+		status = data["result"]
+	}
+	success := false
+	switch strings.ToUpper(status) {
+	case "SUCCESS", "SUCCEED", "COMPLETED", "PAID":
+		success = true
+	}
+
+	// Find payment
+	var payment models.Payment
+	var err error
+	if outTradeNo != "" {
+		paymentPtr, e := s.GetPaymentStatus(outTradeNo)
+		if e == nil && paymentPtr != nil {
+			payment = *paymentPtr
+		} else {
+			err = e
+		}
+	}
+	if payment.ID == "" && tradeNo != "" {
+		// Lookup by transaction_id
+		e := s.db.Conn().QueryRow(
+			"SELECT id, order_id, amount, method, status, transaction_id, phone_number, created_at, updated_at FROM payments WHERE transaction_id = $1",
+			tradeNo,
+		).Scan(&payment.ID, &payment.OrderID, &payment.Amount, &payment.Method, &payment.Status, &payment.TransactionID, &payment.PhoneNumber, &payment.CreatedAt, &payment.UpdatedAt)
+		if e != nil {
+			return e
+		}
+	} else if payment.ID == "" && err != nil {
+		return err
+	}
+
+	// Update payment status
+	newStatus := models.PaymentStatusFailed
+	if success {
+		newStatus = models.PaymentStatusCompleted
+	}
+	if tradeNo != "" && payment.TransactionID == "" {
+		payment.TransactionID = tradeNo
+	}
+	if _, e := s.db.Conn().Exec(
+		"UPDATE payments SET status = $1, transaction_id = COALESCE(NULLIF($2,''), transaction_id), updated_at = $3 WHERE id = $4",
+		newStatus, payment.TransactionID, time.Now(), payment.ID,
+	); e != nil {
+		return e
+	}
+
+	// Update order on success
+	if success {
+		if e := s.updateOrderAfterPayment(payment.OrderID); e != nil {
+			return e
+		}
+	}
+	return nil
 }

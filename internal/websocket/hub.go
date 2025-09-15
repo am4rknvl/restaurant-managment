@@ -19,7 +19,6 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
-	// role can be "kitchen" or "client"
 	role string
 }
 

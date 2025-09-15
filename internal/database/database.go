@@ -8,7 +8,7 @@ import (
 
 	"restaurant-system/internal/models"
 
-
+	_ "github.com/lib/pq"
 )
 
 type DB struct {
